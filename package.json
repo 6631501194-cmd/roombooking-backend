@@ -8,10 +8,19 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",
+    "cors": "^2.8.5",
     "express": "^5.1.0",
     "mysql2": "^3.15.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/6631501194-cmd/roombooking-backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/6631501194-cmd/roombooking-backend/issues"
+  },
+  "homepage": "https://github.com/6631501194-cmd/roombooking-backend#readme",
+  "description": ""
 }
