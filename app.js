@@ -22,6 +22,14 @@ app.post('/api/register', async (req, res) => {
   if (!email || !username || !password) {
     return res.status(400).send("Missing required fields");
   }
+  
+  // ✅ FIXED: ADDED EMAIL VALIDATION CHECK
+  const emailRegex = /^[a-zA-Z0-9.a-zA-Z0-9.!#$%&'*+-/=?^_`{|}~]+@[a-zA-Z0-9]+\.[a-zA-Z]+$/;
+  if (!emailRegex.test(email)) {
+    // Send a 400 Bad Request error if the email format is invalid
+    return res.status(400).send("Invalid email format");
+  }
+  // ✅ END OF FIX
 
   try {
     // 2) Check if email already exists
@@ -412,6 +420,211 @@ app.get('/api/user/:userId/history', (req, res) => {
     });
   });
 });
+
+
+
+////---------------Lecturer-------------/////
+
+// GET /api/dashboard/stats
+// Gets the counts for the lecturer/staff dashboard
+app.get('/api/dashboard/stats', (req, res) => {
+  // Set timezone to ensure CURDATE() is correct
+  con.query("SET time_zone = '+07:00'", (tzErr) => {
+    if (tzErr) return res.status(500).json({ message: 'Database server error' });
+
+    // This single query gets all 4 counts at once
+    const sql = `
+      SELECT
+        (SELECT COUNT(*) FROM room WHERE room_status = 'enable') AS availableCount,
+        (SELECT COUNT(*) FROM room WHERE room_status = 'disable') AS disabledCount,
+        (SELECT COUNT(*) FROM booking WHERE booking_status = 'pending' AND DATE(booking_datetime) = CURDATE()) AS pendingCount,
+        (SELECT COUNT(*) FROM booking WHERE booking_status = 'reserved' AND DATE(booking_datetime) = CURDATE()) AS reservedCount;
+    `;
+
+    con.query(sql, (err, rows) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).json({ message: 'Database query error' });
+      }
+      
+      // rows will be an array with one object: [{ availableCount: 4, disabledCount: 1, ... }]
+      if (rows.length === 0) {
+        // This should theoretically never happen, but good to check
+        return res.status(500).json({ message: 'Failed to fetch stats' });
+      }
+
+      // Send the first (and only) result object
+      res.json(rows[0]);
+    });
+  });
+});
+
+
+// GET /api/bookings/pending
+// Gets all pending bookings for today (for lecturer/staff)
+app.get('/api/bookings/pending', (req, res) => {
+  // Set timezone to ensure CURDATE() is correct
+  con.query("SET time_zone = '+07:00'", (tzErr) => {
+    if (tzErr) return res.status(500).json({ message: 'Database server error' });
+
+    // This query joins all tables to get info for all pending bookings for today
+    const sql = `
+      SELECT
+        b.booking_id,
+        b.booking_status,
+        r.room_id,
+        r.room_name,
+        r.room_type,
+        DATE_FORMAT(ts.start_time, '%H:%i') AS startTime,
+        DATE_FORMAT(ts.end_time, '%H:%i') AS endTime,
+        u.username AS requesterName
+      FROM booking b
+      JOIN room r ON b.room_id = r.room_id
+      JOIN time_slot ts ON b.slot_id = ts.slot_id
+      JOIN user u ON b.user_id = u.user_id
+      WHERE
+        b.booking_status = 'pending'
+        AND DATE(b.booking_datetime) = CURDATE()
+      ORDER BY b.booking_datetime ASC;
+    `;
+
+    con.query(sql, (err, rows) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).json({ message: 'Database query error' });
+      }
+
+      // Format the data to be simple for Flutter
+      const data = rows.map(item => ({
+        bookingId: item.booking_id,
+        roomName: item.room_name,
+        roomType: item.room_type,
+        time: `${item.startTime}-${item.endTime}`,
+        status: item.booking_status,
+        requesterName: item.requesterName,
+        imageUrl: `/api/rooms/${item.room_id}/image` // Add the image URL
+      }));
+
+      res.json(data);
+    });
+  });
+});
+
+
+// POST /api/bookings/:bookingId/approve
+// Approves a pending booking
+app.post('/api/bookings/:bookingId/approve', (req, res) => {
+  const { bookingId } = req.params;
+  const { approverId } = req.body; // The ID of the lecturer who approved
+
+  if (!approverId) {
+    return res.status(400).json({ message: 'Approver ID is required' });
+  }
+
+  const sql = `
+    UPDATE booking
+    SET booking_status = 'reserved',
+        approver_id = ?
+    WHERE booking_id = ? AND booking_status = 'pending'
+  `;
+
+  con.query(sql, [approverId, bookingId], (err, result) => {
+    if (err) return res.status(500).json({ message: 'Database error' });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Booking not found or already processed' });
+    }
+    res.status(200).json({ message: 'Booking approved' });
+  });
+});
+
+
+// POST /api/bookings/:bookingId/reject
+// Rejects a pending booking
+app.post('/api/bookings/:bookingId/reject', (req, res) => {
+  const { bookingId } = req.params;
+  const { approverId, reason } = req.body;
+
+  if (!approverId || !reason) {
+    return res.status(400).json({ message: 'Approver ID and reason are required' });
+  }
+
+  const sql = `
+    UPDATE booking
+    SET booking_status = 'rejected',
+        approver_id = ?,
+        reject_reason = ?
+    WHERE booking_id = ? AND booking_status = 'pending'
+  `;
+
+  con.query(sql, [approverId, reason, bookingId], (err, result) => {
+    if (err) return res.status(500).json({ message: 'Database error' });
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: 'Booking not found or already processed' });
+    }
+    res.status(200).json({ message: 'Booking rejected' });
+  });
+});
+
+
+
+// GET /api/bookings/history
+// Gets all processed bookings (reserved/rejected) for the lecturer history view
+// GET /api/lecturer/:userId/history
+// Gets the history of bookings *processed* by a specific lecturer
+app.get('/api/lecturer/:userId/history', (req, res) => {
+  const { userId } = req.params; // This is the lecturer's ID
+
+  con.query("SET time_zone = '+07:00'", (tzErr) => {
+    if (tzErr) return res.status(500).json({ message: 'Database server error' });
+
+    const sql = `
+      SELECT
+        b.booking_id,
+        b.booking_status,
+        b.reject_reason,
+        DATE_FORMAT(b.booking_datetime, '%b %d, %Y') AS bookingDate,
+        r.room_name,
+        r.room_type,
+        DATE_FORMAT(ts.start_time, '%H:%i') AS startTime,
+        DATE_FORMAT(ts.end_time, '%H:%i') AS endTime,
+        u.username AS requesterName,
+        a.username AS approverName
+      FROM booking b
+      JOIN room r ON b.room_id = r.room_id
+      JOIN time_slot ts ON b.slot_id = ts.slot_id
+      JOIN user u ON b.user_id = u.user_id
+      LEFT JOIN user a ON b.approver_id = a.user_id
+      WHERE
+        b.approver_id = ?   -- ✅ This is the new line
+        AND b.booking_status IN ('reserved', 'rejected')
+      ORDER BY b.booking_datetime DESC;
+    `;
+
+    // Pass the lecturer's ID into the query
+    con.query(sql, [userId], (err, rows) => {
+      if (err) {
+        console.error(err);
+        return res.status(500).json({ message: 'Database query error' });
+      }
+
+      const data = rows.map(item => ({
+        bookingId: item.booking_id,
+        status: item.status,
+        rejectReason: item.reject_reason,
+        date: item.bookingDate,
+        roomName: item.room_name,
+        roomType: item.room_type,
+        time: `${item.startTime}-${item.endTime}`,
+        requesterName: item.requesterName,
+        approverName: item.approverName || 'N/A'
+      }));
+
+      res.json(data);
+    });
+  });
+});
+
+
 //=================== Starting server =======================
 const port = 3000;
 app.listen(port, () => {
