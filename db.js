@@ -3,7 +3,7 @@ const con = mysql.createConnection({
     host: 'localhost',
     user: 'root',
     password: '',
-    database: 'room_booking'
+    database: 'project'
 });
 
 
