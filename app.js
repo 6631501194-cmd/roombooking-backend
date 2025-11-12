@@ -1,16 +1,45 @@
 const express = require('express');
 const argon2 = require('@node-rs/argon2');
 const con = require('./db');
+const jwt = require('jsonwebtoken'); // 1. IMPORT JWT
 
+// 2. DEFINE YOUR SECRET KEY
+// (In a real app, put this in a .env file, not in the code)
+const JWT_SECRET = 'your-super-secure-and-long-random-string-12345';
 
 const app = express();
 app.use(express.json());
 
+
+// 3. CREATE THE VERIFY TOKEN MIDDLEWARE
+function verifyToken(req, res, next) {
+  // Get the token from the header
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Format: "Bearer TOKEN"
+
+  if (token == null) {
+    return res.status(401).json({ message: 'Error: No token provided.' });
+  }
+
+  // Check if the token is valid
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      console.log(err);
+      return res.status(403).json({ message: 'Error: Invalid or expired token.' });
+    }
+    // If valid, save the user's info to the request object
+    req.user = user; // This now contains { userId, role, username }
+    next(); // Move to the next function (the actual route handler)
+  });
+}
+
+
+// --- UNPROTECTED ROUTES ---
+// (Login and Register do not need a token)
+
 app.get('/api/password/:raw', (req, res) => {
    const raw = req.params.raw;
    const hash = argon2.hashSync(raw);
-    // console.log(hash.length);
-    // 97 characters
    res.send(hash);
 });
 
@@ -18,40 +47,29 @@ app.get('/api/password/:raw', (req, res) => {
 app.post('/api/register', async (req, res) => {
   const { email, username, password, role } = req.body;
 
-  // 1) Validate required fields
   if (!email || !username || !password) {
     return res.status(400).send("Missing required fields");
   }
   
-  // ✅ FIXED: ADDED EMAIL VALIDATION CHECK
   const emailRegex = /^[a-zA-Z0-9.a-zA-Z0-9.!#$%&'*+-/=?^_`{|}~]+@[a-zA-Z0-9]+\.[a-zA-Z]+$/;
   if (!emailRegex.test(email)) {
-    // Send a 400 Bad Request error if the email format is invalid
     return res.status(400).send("Invalid email format");
   }
-  // ✅ END OF FIX
 
   try {
-    // 2) Check if email already exists
     const checkSql = "SELECT user_id FROM user WHERE email = ?";
     con.query(checkSql, [email], async (err, rows) => {
       if (err) return res.status(500).send("Database server error");
-
       if (rows.length > 0) {
         return res.status(409).send("Email already registered");
       }
-
-      // 3) Hash password
       const hashedPassword = await argon2.hash(password);
-
-      // 4) Insert new user
       const sql = `
         INSERT INTO user (email, username, password, role, createdAt)
         VALUES (?, ?, ?, ?, NOW())
       `;
       con.query(sql, [email, username, hashedPassword, role || "student"], (err, result) => {
         if (err) return res.status(500).send("Database server error");
-
         res.json({
           message: "User registered successfully",
           userId: result.insertId
@@ -79,19 +97,31 @@ app.post('/api/login', (req, res) => {
 
     if (!passwordMatch) return res.status(401).send("Wrong password");
 
+    // 4. ✅ CREATE THE TOKEN
+    const tokenPayload = { 
+      userId: user.user_id, 
+      role: user.role, 
+      username: user.username 
+    };
+    const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: '24h' });
+
+    // 5. ✅ SEND THE TOKEN AND USER INFO
     res.json({
       uid: user.user_id,
       email: user.email,
       username: user.username,
-      role: user.role
+      role: user.role,
+      token: token  // <-- Send token to Flutter
     });
   });
 });
 
 
+// --- PROTECTED ROUTES ---
+// (All routes below this line will use the 'verifyToken' middleware)
+
 // GET /api/rooms
-// GET /api/rooms
-app.get('/api/rooms', (req, res) => {
+app.get('/api/rooms', verifyToken, (req, res) => {
   const sql = `
     SELECT room_id, room_name, room_type, room_status
     FROM room
@@ -99,8 +129,6 @@ app.get('/api/rooms', (req, res) => {
   `;
   con.query(sql, (err, rows) => {
     if (err) return res.status(500).send("Database server error");
-
-    // add an image URL your Flutter can hit
     const data = rows.map(r => ({
       room_id: r.room_id,
       room_name: r.room_name,
@@ -112,7 +140,9 @@ app.get('/api/rooms', (req, res) => {
   });
 });
 
-app.get('/api/rooms/:roomId/image', (req, res) => {
+// GET /api/rooms/:roomId/image
+// Note: We also protect the image route.
+app.get('/api/rooms/:roomId/image', verifyToken, (req, res) => {
   const roomId = req.params.roomId;
   const sql = "SELECT image FROM room WHERE room_id = ?";
 
@@ -126,30 +156,34 @@ app.get('/api/rooms/:roomId/image', (req, res) => {
 });
 
 
-
-
 // GET /api/rooms/:roomId/slots
-// Ensure the app/session timezone is Bangkok once at startup:
-// con.query("SET time_zone = '+07:00'");
-
-// GET: list slots for a room with live availability and "expired" rule
-app.get('/api/rooms/:roomId/slots', (req, res) => {
+app.get('/api/rooms/:roomId/slots', verifyToken, (req, res) => {
   const roomId = req.params.roomId;
+  const targetDate = req.query.date; 
 
-  // Ensure MySQL session time zone is correct for NOW()/CURDATE()
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).send("Database server error");
 
-    // 1) Confirm room & status
     const sqlRoom = "SELECT room_status FROM room WHERE room_id = ?";
     con.query(sqlRoom, [roomId], (err, roomRows) => {
       if (err) return res.status(500).send("Database server error");
       if (roomRows.length !== 1) return res.status(404).send("Room not found");
-
       const roomStatus = String(roomRows[0].room_status || '').toLowerCase();
-      const isDisabled = roomStatus === 'disable';
+      
+      let dateFilterSql;
+      let expiryCheckSql;
+      let queryParams;
 
-      // 2) Compute status per time slot for TODAY
+      if (targetDate) {
+        dateFilterSql = 'DATE(b.booking_datetime) = ?';
+        expiryCheckSql = '(? = CURDATE() AND TIME(NOW()) >= ts.end_time)';
+        queryParams = [roomStatus, targetDate, roomId, targetDate];
+      } else {
+        dateFilterSql = 'DATE(b.booking_datetime) = CURDATE()';
+        expiryCheckSql = 'TIME(NOW()) >= ts.end_time';
+        queryParams = [roomStatus, roomId];
+      }
+
       const sql = `
         SELECT
           ts.slot_id,
@@ -157,7 +191,7 @@ app.get('/api/rooms/:roomId/slots', (req, res) => {
           DATE_FORMAT(ts.end_time,   '%H:%i') AS endTime,
           CASE
             WHEN ? = 'disable' THEN 'disabled'
-            WHEN TIME(NOW()) >= ts.end_time THEN 'expired'
+            WHEN ${expiryCheckSql} THEN 'expired'
             WHEN b.booking_status IS NOT NULL THEN b.booking_status
             ELSE 'available'
           END AS computed_status
@@ -165,24 +199,25 @@ app.get('/api/rooms/:roomId/slots', (req, res) => {
         LEFT JOIN booking b
           ON b.room_id = ?
          AND b.slot_id = ts.slot_id
-         AND DATE(b.booking_datetime) = CURDATE()
+         AND ${dateFilterSql}
          AND b.booking_status IN ('pending','reserved')
         ORDER BY ts.start_time ASC
       `;
 
-      con.query(sql, [roomStatus, roomId], (qErr, rows) => {
-        if (qErr) return res.status(500).send("Database server error");
-
+      con.query(sql, queryParams, (qErr, rows) => {
+        if (qErr) {
+          console.error(qErr);
+          return res.status(500).send("Database server error");
+        }
         const data = rows.map(r => {
           const status = String(r.computed_status || 'available').toLowerCase();
           return {
             slotId: r.slot_id,
             time: `${r.startTime}-${r.endTime}`,
-            status,                          // disabled | expired | pending | reserved | available
-            canBook: status === 'available'  // only available can be booked
+            status,
+            canBook: status === 'available'
           };
         });
-
         res.json(data);
       });
     });
@@ -190,24 +225,20 @@ app.get('/api/rooms/:roomId/slots', (req, res) => {
 });
 
 
-
-
-
 // POST /api/rooms/:roomId/slots/:slotId/book
-app.post('/api/rooms/:roomId/slots/:slotId/book', (req, res) => {
+app.post('/api/rooms/:roomId/slots/:slotId/book', verifyToken, (req, res) => {
   const roomId = req.params.roomId;
   const slotId = req.params.slotId;
-  const { userId } = req.body;
+  // ✅ Get userId from the token, not the body!
+  const userId = req.user.userId;
 
   if (!userId) {
-    return res.status(400).json({ code: 'BAD_REQUEST', message: 'userId is required' });
+    return res.status(400).json({ code: 'BAD_REQUEST', message: 'User ID not found in token.' });
   }
 
-  // Make sure NOW()/CURDATE() align with Asia/Bangkok
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ code: 'DB_ERROR', message: 'Database server error' });
-
-    // 1) Room must exist & be enabled
+    
     const sqlRoom = "SELECT room_status FROM room WHERE room_id = ?";
     con.query(sqlRoom, [roomId], (e1, r1) => {
       if (e1) return res.status(500).json({ code: 'DB_ERROR', message: 'Database server error' });
@@ -216,7 +247,6 @@ app.post('/api/rooms/:roomId/slots/:slotId/book', (req, res) => {
         return res.status(409).json({ code: 'ROOM_DISABLED', message: 'This room is under maintenance.' });
       }
 
-      // 2) Does the user already have an ACTIVE booking today? (pending/reserved)
       const sqlUserActiveToday = `
         SELECT booking_status
         FROM booking
@@ -249,7 +279,6 @@ app.post('/api/rooms/:roomId/slots/:slotId/book', (req, res) => {
           });
         }
 
-        // 3A) NEW: Block booking if the slot is already expired today
         const sqlSlotTime = `
           SELECT start_time, end_time
           FROM time_slot
@@ -262,7 +291,6 @@ app.post('/api/rooms/:roomId/slots/:slotId/book', (req, res) => {
             return res.status(404).json({ code: 'SLOT_NOT_FOUND', message: 'Time slot not found' });
           }
 
-          // If current time is later or equal to end_time => expired
           const sqlExpiredCheck = `SELECT TIME(NOW()) >= ? AS isExpired`;
           con.query(sqlExpiredCheck, [rS[0].end_time], (eC, rC) => {
             if (eC) return res.status(500).json({ code: 'DB_ERROR', message: 'Database server error' });
@@ -275,7 +303,6 @@ app.post('/api/rooms/:roomId/slots/:slotId/book', (req, res) => {
               });
             }
 
-            // 3B) Slot must be free (no pending/reserved for this room+slot today)
             const sqlClash = `
               SELECT 1
               FROM booking
@@ -290,7 +317,6 @@ app.post('/api/rooms/:roomId/slots/:slotId/book', (req, res) => {
                 return res.status(409).json({ code: 'SLOT_TAKEN', message: 'This time slot is not available.' });
               }
 
-              // 4) Create pending booking for TODAY
               const sqlInsert = `
                 INSERT INTO booking(user_id, room_id, slot_id, booking_datetime, booking_status)
                 VALUES (?, ?, ?, NOW(), 'pending')
@@ -315,18 +341,13 @@ app.post('/api/rooms/:roomId/slots/:slotId/book', (req, res) => {
 });
 
 
-// GET /api/user/:userId/pending-booking
-// Gets the user's active pending booking for today
-// GET /api/user/:userId/pending-booking
-// Gets the user's active pending booking for today
-app.get('/api/user/:userId/pending-booking', (req, res) => {
-  const { userId } = req.params;
+// GET /api/user/pending-booking (Renamed from /api/user/:userId/pending-booking)
+app.get('/api/user/pending-booking', verifyToken, (req, res) => {
+  // ✅ Use ID from token
+  const { userId } = req.user;
 
-  // Make sure to use Bangkok time
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
-
-    // This query JOINS the tables to get all the info you need
     const sql = `
       SELECT
         b.booking_id,
@@ -346,16 +367,11 @@ app.get('/api/user/:userId/pending-booking', (req, res) => {
       ORDER BY b.booking_id DESC
       LIMIT 1;
     `;
-
     con.query(sql, [userId], (err, rows) => {
       if (err) return res.status(500).json({ message: 'Database query error' });
-
       if (rows.length === 0) {
-        // No pending booking found for today, this is not an error
         return res.json(null);
       }
-
-      // Found a pending booking, format it and send it back
       const booking = rows[0];
       const data = {
         bookingId: booking.booking_id,
@@ -363,7 +379,6 @@ app.get('/api/user/:userId/pending-booking', (req, res) => {
         roomType: booking.room_type,
         time: `${booking.startTime}-${booking.endTime}`,
         status: booking.booking_status,
-        // Construct the image URL just like you do in /api/rooms
         imageUrl: `/api/rooms/${booking.room_id}/image`
       };
       res.json(data);
@@ -372,14 +387,13 @@ app.get('/api/user/:userId/pending-booking', (req, res) => {
 });
 
 
-// GET /api/user/:userId/history
-// Gets a user's entire booking history (approved and rejected)
-app.get('/api/user/:userId/history', (req, res) => {
-  const { userId } = req.params;
+// GET /api/user/history (Renamed from /api/user/:userId/history)
+app.get('/api/user/history', verifyToken, (req, res) => {
+  // ✅ Use ID from token
+  const { userId } = req.user;
 
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
-
     const sql = `
       SELECT
         b.booking_id,
@@ -400,22 +414,18 @@ app.get('/api/user/:userId/history', (req, res) => {
         AND b.booking_status IN ('reserved', 'rejected')
       ORDER BY b.booking_datetime DESC;
     `;
-
     con.query(sql, [userId], (err, rows) => {
       if (err) return res.status(500).json({ message: 'Database query error' });
-
-      // Format the data to be simple for Flutter
       const data = rows.map(item => ({
         bookingId: item.booking_id,
-        status: item.booking_status, // 'reserved' or 'rejected'
+        status: item.booking_status,
         rejectReason: item.reject_reason,
         date: item.bookingDate,
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
-        approverName: item.approverName || 'N/A' // Handle if approver is null
+        approverName: item.approverName || 'N/A'
       }));
-
       res.json(data);
     });
   });
@@ -426,19 +436,9 @@ app.get('/api/user/:userId/history', (req, res) => {
 ////---------------Lecturer-------------/////
 
 // GET /api/dashboard/stats
-// Gets the counts for the lecturer/staff dashboard
-// GET /api/dashboard/stats
-// Gets the counts for the lecturer/staff dashboard based on SLOTS
-// GET /api/dashboard/stats
-// Gets the counts for the lecturer/staff dashboard based on SLOTS
-// GET /api/dashboard/stats
-// Gets the counts for the lecturer/staff dashboard based on SLOTS
-app.get('/api/dashboard/stats', (req, res) => {
-  // Set timezone to ensure CURDATE() and TIME(NOW()) are correct
+app.get('/api/dashboard/stats', verifyToken, (req, res) => {
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
-
-    // This query gets all the raw numbers needed for the calculation
     const sql = `
       SELECT
         (SELECT COUNT(*) FROM room WHERE room_status = 'enable') AS enabledRooms,
@@ -448,7 +448,6 @@ app.get('/api/dashboard/stats', (req, res) => {
         (SELECT COUNT(*) FROM booking WHERE booking_status = 'reserved' AND DATE(booking_datetime) = CURDATE()) AS reservedCount,
         (SELECT COUNT(*) FROM time_slot WHERE end_time <= TIME(NOW())) AS expiredSlotsCount;
     `;
-
     con.query(sql, (err, rows) => {
       if (err) {
         console.error(err);
@@ -457,38 +456,16 @@ app.get('/api/dashboard/stats', (req, res) => {
       if (rows.length === 0) {
         return res.status(500).json({ message: 'Failed to fetch stats' });
       }
-
       const stats = rows[0];
-      
-      // --- Start Calculations ---
-      
-      // 1. Get base counts
-      const slotsPerRoom = stats.slotsPerRoom; // This will be 4
+      const slotsPerRoom = stats.slotsPerRoom;
       const pendingCount = stats.pendingCount;
       const reservedCount = stats.reservedCount;
-      
-      // 2. Disabled Slots (Total)
-      // This is permanent: (Total Disabled Rooms * 4 slots)
       const disabledCount = stats.disabledRooms * slotsPerRoom;
-
-      // 3. Available Slots (Today)
-      // This is: (Total Enabled Slots for Today) - (Pending) - (Reserved) - (Expired)
-      
-      // Total slots in all *enabled* rooms
       const totalEnabledSlots = stats.enabledRooms * slotsPerRoom;
-      
-      // Number of *expired* slots today (only from enabled rooms)
-      // We multiply expired slots by enabled rooms
       const expiredCountToday = stats.expiredSlotsCount * stats.enabledRooms;
-      
-      // Your formula: Available = (Total Enabled) - (Booked) - (Expired)
       const availableCount = totalEnabledSlots - pendingCount - reservedCount - expiredCountToday;
 
-      // --- End Calculations ---
-
-      // Send the final JSON
       res.json({
-        // We make sure availableCount is not negative
         availableCount: (availableCount < 0) ? 0 : availableCount,
         pendingCount: pendingCount,
         reservedCount: reservedCount,
@@ -497,15 +474,12 @@ app.get('/api/dashboard/stats', (req, res) => {
     });
   });
 });
+
+
 // GET /api/bookings/pending
-// Gets all pending bookings for today (for lecturer/staff)
-// GET /api/bookings/pending
-// Gets all pending bookings for today (for lecturer/staff)
-app.get('/api/bookings/pending', (req, res) => {
-  // Set timezone to ensure CURDATE() is correct
+app.get('/api/bookings/pending', verifyToken, (req, res) => {
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
-
     const sql = `
       SELECT
         b.booking_id,
@@ -525,23 +499,20 @@ app.get('/api/bookings/pending', (req, res) => {
         AND DATE(b.booking_datetime) = CURDATE()
       ORDER BY b.booking_datetime ASC;
     `;
-
     con.query(sql, (err, rows) => {
       if (err) {
         console.error(err);
         return res.status(500).json({ message: 'Database query error' });
       }
-
       const data = rows.map(item => ({
         bookingId: item.booking_id,
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
         status: item.booking_status,
-        requesterName: item.requesterName || 'Unknown User', // Fix for 'Null' error
+        requesterName: item.requesterName || 'Unknown User',
         imageUrl: `/api/rooms/${item.room_id}/image`
       }));
-
       res.json(data);
     });
   });
@@ -549,13 +520,13 @@ app.get('/api/bookings/pending', (req, res) => {
 
 
 // POST /api/bookings/:bookingId/approve
-// Approves a pending booking
-app.post('/api/bookings/:bookingId/approve', (req, res) => {
+app.post('/api/bookings/:bookingId/approve', verifyToken, (req, res) => {
   const { bookingId } = req.params;
-  const { approverId } = req.body; 
+  // ✅ Get approverId from the token
+  const approverId = req.user.userId;
 
   if (!approverId) {
-    return res.status(400).json({ message: 'Approver ID is required' });
+    return res.status(400).json({ message: 'Approver ID not found in token' });
   }
 
   const sql = `
@@ -564,7 +535,6 @@ app.post('/api/bookings/:bookingId/approve', (req, res) => {
         approver_id = ?
     WHERE booking_id = ? AND booking_status = 'pending'
   `;
-
   con.query(sql, [approverId, bookingId], (err, result) => {
     if (err) return res.status(500).json({ message: 'Database error' });
     if (result.affectedRows === 0) {
@@ -576,13 +546,14 @@ app.post('/api/bookings/:bookingId/approve', (req, res) => {
 
 
 // POST /api/bookings/:bookingId/reject
-// Rejects a pending booking
-app.post('/api/bookings/:bookingId/reject', (req, res) => {
+app.post('/api/bookings/:bookingId/reject', verifyToken, (req, res) => {
   const { bookingId } = req.params;
-  const { approverId, reason } = req.body;
+  const { reason } = req.body;
+  // ✅ Get approverId from the token
+  const approverId = req.user.userId;
 
   if (!approverId || !reason) {
-    return res.status(400).json({ message: 'Approver ID and reason are required' });
+    return res.status(400).json({ message: 'Approver ID (from token) and reason (from body) are required' });
   }
 
   const sql = `
@@ -592,7 +563,6 @@ app.post('/api/bookings/:bookingId/reject', (req, res) => {
         reject_reason = ?
     WHERE booking_id = ? AND booking_status = 'pending'
   `;
-
   con.query(sql, [approverId, reason, bookingId], (err, result) => {
     if (err) return res.status(500).json({ message: 'Database error' });
     if (result.affectedRows === 0) {
@@ -602,12 +572,11 @@ app.post('/api/bookings/:bookingId/reject', (req, res) => {
   });
 });
 
-// GET /api/lecturer/:userId/history
-// Gets the history of bookings *processed* by a specific lecturer
-// GET /api/lecturer/:userId/history
-// Gets the history of bookings *processed* by a specific lecturer
-app.get('/api/lecturer/:userId/history', (req, res) => {
-  const { userId } = req.params; // This is the lecturer's ID
+
+// GET /api/lecturer/history (Renamed from /api/lecturer/:userId/history)
+app.get('/api/lecturer/history', verifyToken, (req, res) => {
+  // ✅ Get lecturer's ID from token
+  const { userId } = req.user;
 
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
@@ -630,18 +599,15 @@ app.get('/api/lecturer/:userId/history', (req, res) => {
       JOIN user u ON b.user_id = u.user_id
       LEFT JOIN user a ON b.approver_id = a.user_id
       WHERE
-        b.approver_id = ?   -- This gets history for ONLY this lecturer
+        b.approver_id = ?
         AND b.booking_status IN ('reserved', 'rejected')
       ORDER BY b.booking_datetime DESC;
     `;
-
-    // Pass the lecturer's ID into the query
     con.query(sql, [userId], (err, rows) => {
       if (err) {
         console.error(err);
         return res.status(500).json({ message: 'Database query error' });
       }
-
       const data = rows.map(item => ({
         bookingId: item.booking_id,
         status: item.booking_status,
@@ -650,14 +616,14 @@ app.get('/api/lecturer/:userId/history', (req, res) => {
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
-        requesterName: item.requesterName || 'Unknown User', // Fix for 'Null' error
+        requesterName: item.requesterName || 'Unknown User',
         approverName: item.approverName || 'N/A'
       }));
-
       res.json(data);
     });
   });
 });
+
 
 //=================== Starting server =======================
 const port = 3000;
