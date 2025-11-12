@@ -427,18 +427,26 @@ app.get('/api/user/:userId/history', (req, res) => {
 
 // GET /api/dashboard/stats
 // Gets the counts for the lecturer/staff dashboard
+// GET /api/dashboard/stats
+// Gets the counts for the lecturer/staff dashboard based on SLOTS
+// GET /api/dashboard/stats
+// Gets the counts for the lecturer/staff dashboard based on SLOTS
+// GET /api/dashboard/stats
+// Gets the counts for the lecturer/staff dashboard based on SLOTS
 app.get('/api/dashboard/stats', (req, res) => {
-  // Set timezone to ensure CURDATE() is correct
+  // Set timezone to ensure CURDATE() and TIME(NOW()) are correct
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
 
-    // This single query gets all 4 counts at once
+    // This query gets all the raw numbers needed for the calculation
     const sql = `
       SELECT
-        (SELECT COUNT(*) FROM room WHERE room_status = 'enable') AS availableCount,
-        (SELECT COUNT(*) FROM room WHERE room_status = 'disable') AS disabledCount,
+        (SELECT COUNT(*) FROM room WHERE room_status = 'enable') AS enabledRooms,
+        (SELECT COUNT(*) FROM room WHERE room_status = 'disable') AS disabledRooms,
+        (SELECT COUNT(*) FROM time_slot) AS slotsPerRoom,
         (SELECT COUNT(*) FROM booking WHERE booking_status = 'pending' AND DATE(booking_datetime) = CURDATE()) AS pendingCount,
-        (SELECT COUNT(*) FROM booking WHERE booking_status = 'reserved' AND DATE(booking_datetime) = CURDATE()) AS reservedCount;
+        (SELECT COUNT(*) FROM booking WHERE booking_status = 'reserved' AND DATE(booking_datetime) = CURDATE()) AS reservedCount,
+        (SELECT COUNT(*) FROM time_slot WHERE end_time <= TIME(NOW())) AS expiredSlotsCount;
     `;
 
     con.query(sql, (err, rows) => {
@@ -446,20 +454,51 @@ app.get('/api/dashboard/stats', (req, res) => {
         console.error(err);
         return res.status(500).json({ message: 'Database query error' });
       }
-      
-      // rows will be an array with one object: [{ availableCount: 4, disabledCount: 1, ... }]
       if (rows.length === 0) {
-        // This should theoretically never happen, but good to check
         return res.status(500).json({ message: 'Failed to fetch stats' });
       }
 
-      // Send the first (and only) result object
-      res.json(rows[0]);
+      const stats = rows[0];
+      
+      // --- Start Calculations ---
+      
+      // 1. Get base counts
+      const slotsPerRoom = stats.slotsPerRoom; // This will be 4
+      const pendingCount = stats.pendingCount;
+      const reservedCount = stats.reservedCount;
+      
+      // 2. Disabled Slots (Total)
+      // This is permanent: (Total Disabled Rooms * 4 slots)
+      const disabledCount = stats.disabledRooms * slotsPerRoom;
+
+      // 3. Available Slots (Today)
+      // This is: (Total Enabled Slots for Today) - (Pending) - (Reserved) - (Expired)
+      
+      // Total slots in all *enabled* rooms
+      const totalEnabledSlots = stats.enabledRooms * slotsPerRoom;
+      
+      // Number of *expired* slots today (only from enabled rooms)
+      // We multiply expired slots by enabled rooms
+      const expiredCountToday = stats.expiredSlotsCount * stats.enabledRooms;
+      
+      // Your formula: Available = (Total Enabled) - (Booked) - (Expired)
+      const availableCount = totalEnabledSlots - pendingCount - reservedCount - expiredCountToday;
+
+      // --- End Calculations ---
+
+      // Send the final JSON
+      res.json({
+        // We make sure availableCount is not negative
+        availableCount: (availableCount < 0) ? 0 : availableCount,
+        pendingCount: pendingCount,
+        reservedCount: reservedCount,
+        disabledCount: disabledCount
+      });
     });
   });
 });
-
-
+// GET /api/bookings/pending
+// Gets all pending bookings for today (for lecturer/staff)
 // GET /api/bookings/pending
 // Gets all pending bookings for today (for lecturer/staff)
 app.get('/api/bookings/pending', (req, res) => {
@@ -467,7 +506,6 @@ app.get('/api/bookings/pending', (req, res) => {
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
 
-    // This query joins all tables to get info for all pending bookings for today
     const sql = `
       SELECT
         b.booking_id,
@@ -494,15 +532,14 @@ app.get('/api/bookings/pending', (req, res) => {
         return res.status(500).json({ message: 'Database query error' });
       }
 
-      // Format the data to be simple for Flutter
       const data = rows.map(item => ({
         bookingId: item.booking_id,
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
         status: item.booking_status,
-        requesterName: item.requesterName,
-        imageUrl: `/api/rooms/${item.room_id}/image` // Add the image URL
+        requesterName: item.requesterName || 'Unknown User', // Fix for 'Null' error
+        imageUrl: `/api/rooms/${item.room_id}/image`
       }));
 
       res.json(data);
@@ -515,7 +552,7 @@ app.get('/api/bookings/pending', (req, res) => {
 // Approves a pending booking
 app.post('/api/bookings/:bookingId/approve', (req, res) => {
   const { bookingId } = req.params;
-  const { approverId } = req.body; // The ID of the lecturer who approved
+  const { approverId } = req.body; 
 
   if (!approverId) {
     return res.status(400).json({ message: 'Approver ID is required' });
@@ -565,10 +602,8 @@ app.post('/api/bookings/:bookingId/reject', (req, res) => {
   });
 });
 
-
-
-// GET /api/bookings/history
-// Gets all processed bookings (reserved/rejected) for the lecturer history view
+// GET /api/lecturer/:userId/history
+// Gets the history of bookings *processed* by a specific lecturer
 // GET /api/lecturer/:userId/history
 // Gets the history of bookings *processed* by a specific lecturer
 app.get('/api/lecturer/:userId/history', (req, res) => {
@@ -595,7 +630,7 @@ app.get('/api/lecturer/:userId/history', (req, res) => {
       JOIN user u ON b.user_id = u.user_id
       LEFT JOIN user a ON b.approver_id = a.user_id
       WHERE
-        b.approver_id = ?   -- ✅ This is the new line
+        b.approver_id = ?   -- This gets history for ONLY this lecturer
         AND b.booking_status IN ('reserved', 'rejected')
       ORDER BY b.booking_datetime DESC;
     `;
@@ -609,13 +644,13 @@ app.get('/api/lecturer/:userId/history', (req, res) => {
 
       const data = rows.map(item => ({
         bookingId: item.booking_id,
-        status: item.status,
+        status: item.booking_status,
         rejectReason: item.reject_reason,
         date: item.bookingDate,
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
-        requesterName: item.requesterName,
+        requesterName: item.requesterName || 'Unknown User', // Fix for 'Null' error
         approverName: item.approverName || 'N/A'
       }));
 
@@ -623,7 +658,6 @@ app.get('/api/lecturer/:userId/history', (req, res) => {
     });
   });
 });
-
 
 //=================== Starting server =======================
 const port = 3000;
