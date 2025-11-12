@@ -141,7 +141,6 @@ app.get('/api/rooms', verifyToken, (req, res) => {
 });
 
 // GET /api/rooms/:roomId/image
-// Note: We also protect the image route.
 app.get('/api/rooms/:roomId/image', verifyToken, (req, res) => {
   const roomId = req.params.roomId;
   const sql = "SELECT image FROM room WHERE room_id = ?";
@@ -341,7 +340,7 @@ app.post('/api/rooms/:roomId/slots/:slotId/book', verifyToken, (req, res) => {
 });
 
 
-// GET /api/user/pending-booking (Renamed from /api/user/:userId/pending-booking)
+// GET /api/user/pending-booking (No :userId needed)
 app.get('/api/user/pending-booking', verifyToken, (req, res) => {
   // ✅ Use ID from token
   const { userId } = req.user;
@@ -387,7 +386,7 @@ app.get('/api/user/pending-booking', verifyToken, (req, res) => {
 });
 
 
-// GET /api/user/history (Renamed from /api/user/:userId/history)
+// GET /api/user/history (No :userId needed)
 app.get('/api/user/history', verifyToken, (req, res) => {
   // ✅ Use ID from token
   const { userId } = req.user;
@@ -433,7 +432,7 @@ app.get('/api/user/history', verifyToken, (req, res) => {
 
 
 
-////---------------Lecturer-------------/////
+////---------------Lecturer (Already Protected)-------------/////
 
 // GET /api/dashboard/stats
 app.get('/api/dashboard/stats', verifyToken, (req, res) => {
@@ -522,7 +521,6 @@ app.get('/api/bookings/pending', verifyToken, (req, res) => {
 // POST /api/bookings/:bookingId/approve
 app.post('/api/bookings/:bookingId/approve', verifyToken, (req, res) => {
   const { bookingId } = req.params;
-  // ✅ Get approverId from the token
   const approverId = req.user.userId;
 
   if (!approverId) {
@@ -549,7 +547,6 @@ app.post('/api/bookings/:bookingId/approve', verifyToken, (req, res) => {
 app.post('/api/bookings/:bookingId/reject', verifyToken, (req, res) => {
   const { bookingId } = req.params;
   const { reason } = req.body;
-  // ✅ Get approverId from the token
   const approverId = req.user.userId;
 
   if (!approverId || !reason) {
@@ -575,7 +572,6 @@ app.post('/api/bookings/:bookingId/reject', verifyToken, (req, res) => {
 
 // GET /api/lecturer/history (Renamed from /api/lecturer/:userId/history)
 app.get('/api/lecturer/history', verifyToken, (req, res) => {
-  // ✅ Get lecturer's ID from token
   const { userId } = req.user;
 
   con.query("SET time_zone = '+07:00'", (tzErr) => {
