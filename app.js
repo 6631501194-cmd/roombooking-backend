@@ -476,7 +476,7 @@ app.get('/api/dashboard/stats', verifyToken, (req, res) => {
 
 
 // GET /api/bookings/pending
-app.get('/api/bookings/pending', verifyToken, (req, res) => {
+app.get('/api/lecturer/bookings/pending', verifyToken, (req, res) => {
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
     const sql = `
@@ -612,7 +612,7 @@ app.get('/api/lecturer/history', verifyToken, (req, res) => {
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
-        requesterName: item.requesterName || 'Unknown User',
+        requesterName: item.requesterName || 'Unknown User', // ✅ FIX
         approverName: item.approverName || 'N/A'
       }));
       res.json(data);
