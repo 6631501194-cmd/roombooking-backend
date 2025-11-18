@@ -2,6 +2,9 @@ const express = require('express');
 const argon2 = require('@node-rs/argon2');
 const con = require('./db');
 const jwt = require('jsonwebtoken'); // 1. IMPORT JWT
+const multer = require('multer');
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 // 2. DEFINE YOUR SECRET KEY
 // (In a real app, put this in a .env file, not in the code)
@@ -434,7 +437,8 @@ app.get('/api/user/history', verifyToken, (req, res) => {
 
 ////---------------Lecturer (Already Protected)-------------/////
 
-// GET /api/dashboard/stats
+// GET /api/dashboard/stats 
+// use this api route for staff dashboard
 app.get('/api/dashboard/stats', verifyToken, (req, res) => {
   con.query("SET time_zone = '+07:00'", (tzErr) => {
     if (tzErr) return res.status(500).json({ message: 'Database server error' });
@@ -619,6 +623,103 @@ app.get('/api/lecturer/history', verifyToken, (req, res) => {
     });
   });
 });
+
+
+
+
+
+
+
+
+//staff functions api //
+
+app.post('/api/rooms', verifyToken, upload.single('image'), (req, res) => {
+    const { room_name, room_type } = req.body;
+    const imageFile = req.file;
+
+    if (!room_name || !room_type || !imageFile) {
+        return res.status(400).json({ message: 'Missing name, type, or image.' });
+    }
+
+    // Default status is 'enable'
+    const sql = `
+    INSERT INTO room (room_name, room_type, room_status, image)
+    VALUES (?, ?, 'enable', ?)
+  `;
+
+    con.query(sql, [room_name, room_type, imageFile.buffer], (err, result) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).json({ message: 'Database error while adding room.' });
+        }
+        res.status(201).json({
+            message: 'Room added successfully',
+            roomId: result.insertId
+        });
+    });
+});
+
+
+
+// PUT /api/rooms/:roomId - Update Room Details //// -----------edit ---------///
+app.put('/api/rooms/:roomId', verifyToken, upload.single('image'), (req, res) => {
+    const { roomId } = req.params;
+    const { room_name, room_type } = req.body;
+    const imageFile = req.file; // Will be undefined if user didn't change image
+
+    if (!room_name || !room_type) {
+        return res.status(400).json({ message: 'Name and Type are required.' });
+    }
+
+    let sql, params;
+
+    // Case 1: User uploaded a NEW image -> Update everything
+    if (imageFile) {
+        sql = "UPDATE room SET room_name = ?, room_type = ?, image = ? WHERE room_id = ?";
+        params = [room_name, room_type, imageFile.buffer, roomId];
+    } 
+    // Case 2: No new image -> Only update text fields
+    else {
+        sql = "UPDATE room SET room_name = ?, room_type = ? WHERE room_id = ?";
+        params = [room_name, room_type, roomId];
+    }
+
+    con.query(sql, params, (err, result) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).json({ message: 'Database error.' });
+        }
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ message: 'Room not found.' });
+        }
+        res.json({ message: 'Room updated successfully.' });
+    });
+});
+
+
+
+app.put('/api/rooms/:roomId/status', verifyToken, (req, res) => {
+    const { roomId } = req.params;
+    const { status } = req.body; // Expect 'enable' or 'disable'
+
+    // Validate input
+    if (status !== 'enable' && status !== 'disable') {
+        return res.status(400).json({ message: 'Invalid status. Use "enable" or "disable".' });
+    }
+
+    const sql = "UPDATE room SET room_status = ? WHERE room_id = ?";
+    con.query(sql, [status, roomId], (err, result) => {
+        if (err) {
+            console.error(err);
+            return res.status(500).json({ message: 'Database error.' });
+        }
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ message: 'Room not found.' });
+        }
+        res.json({ message: 'Room status updated successfully.' });
+    });
+});
+
 
 
 //=================== Starting server =======================
