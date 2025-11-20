@@ -149,6 +149,7 @@ router.get('/api/lecturer/history', verifyToken, (req, res) => {
         b.booking_status,
         b.reject_reason,
         DATE_FORMAT(b.booking_datetime, '%b %d, %Y') AS bookingDate,
+        r.room_id,
         r.room_name,
         r.room_type,
         DATE_FORMAT(ts.start_time, '%H:%i') AS startTime,
@@ -167,7 +168,7 @@ router.get('/api/lecturer/history', verifyToken, (req, res) => {
     `;
     con.query(sql, [userId], (err, rows) => {
       if (err) {
-        console.error(err);
+        console.error('lecturer/history SQL error:', err);
         return res.status(500).json({ message: 'Database query error' });
       }
       const data = rows.map(item => ({
@@ -178,8 +179,9 @@ router.get('/api/lecturer/history', verifyToken, (req, res) => {
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
-        requesterName: item.requesterName || 'Unknown User', // ✅ FIX
-        approverName: item.approverName || 'N/A'
+        requesterName: item.requesterName || 'Unknown User',
+        approverName: item.approverName || 'N/A',
+        imageUrl: `/api/rooms/${item.room_id}/image`
       }));
       res.json(data);
     });

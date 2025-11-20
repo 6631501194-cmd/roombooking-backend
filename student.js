@@ -267,6 +267,7 @@ router.get('/api/user/history', verifyToken, (req, res) => {
         b.booking_status,
         b.reject_reason,
         DATE_FORMAT(b.booking_datetime, '%b %d, %Y') AS bookingDate,
+        r.room_id,
         r.room_name,
         r.room_type,
         DATE_FORMAT(ts.start_time, '%H:%i') AS startTime,
@@ -291,11 +292,14 @@ router.get('/api/user/history', verifyToken, (req, res) => {
         roomName: item.room_name,
         roomType: item.room_type,
         time: `${item.startTime}-${item.endTime}`,
-        approverName: item.approverName || 'N/A'
+        approverName: item.approverName || 'N/A',
+        // add imageUrl so the client can fetch the binary image endpoint
+        imageUrl: `/api/rooms/${item.room_id}/image`
       }));
       res.json(data);
     });
   });
 });
+
 
 module.exports = router;
